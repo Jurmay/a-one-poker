@@ -1,0 +1,485 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  freshDeck, bestHand, villainDecision,
+  createPlayer, createGameState, HAND_NAMES
+} from '../engine/poker';
+import { createTable, updateTable, subscribeToTable, saveHandHistory } from '../lib/supabase';
+import { getCoaching, getPreActionAdvice } from '../lib/claudeCoach';
+
+const LOCAL_MODE = !process.env.REACT_APP_SUPABASE_URL;
+
+export function useGameState(tableId, isAdmin = true) {
+  const [state, setState] = useState(null);
+  const [coaching, setCoaching] = useState(null);       // post-action grade
+  const [advice, setAdvice] = useState(null);           // pre-action recommendation
+  const stateRef = useRef(null);
+  const villainTimerRef = useRef(null);
+  const adviceForTurnRef = useRef(null); // tracks which "turn" we already fetched advice for, to avoid duplicate calls
+
+  const persist = useCallback(async (newState) => {
+    stateRef.current = newState;
+    setState(newState);
+    if (!LOCAL_MODE && tableId) {
+      await updateTable(tableId, newState);
+      // A hand just completed and hasn't been saved yet — persist it to
+      // hand_history, then clear the marker so it isn't saved again on
+      // every subsequent state update (e.g. the next hand's blinds posting).
+      if (newState.lastCompletedHand && !newState._handHistorySaved) {
+        await saveHandHistory(tableId, newState.lastCompletedHand);
+        newState._handHistorySaved = true;
+      }
+    }
+  }, [tableId]);
+
+  // Subscribe to remote updates (villain screens)
+  useEffect(() => {
+    if (LOCAL_MODE || !tableId || isAdmin) return;
+    const sub = subscribeToTable(tableId, (remoteState) => {
+      stateRef.current = remoteState;
+      setState(remoteState);
+    });
+    return () => { sub.unsubscribe(); };
+  }, [tableId, isAdmin]);
+
+  // Fire pre-action advice automatically whenever it becomes Hero's turn.
+  // A "turn fingerprint" (hand + phase + actingIdx) prevents re-fetching on
+  // unrelated re-renders, while still re-firing for each genuinely new decision.
+  useEffect(() => {
+    if (!state) return;
+    const heroIdx = state.players?.findIndex(p => p.isHero);
+    if (heroIdx === -1 || state.actingIdx !== heroIdx) return;
+    if (state.phase === 'idle' || state.phase === 'showdown') return;
+
+    const fingerprint = `${state.handNum}:${state.phase}:${state.actingIdx}:${state.pot}:${state.currentBet}`;
+    if (adviceForTurnRef.current === fingerprint) return;
+    adviceForTurnRef.current = fingerprint;
+
+    const hero = state.players[heroIdx];
+    setAdvice({ source: 'loading' });
+    getPreActionAdvice(hero, state)
+      .then(result => setAdvice(result))
+      .catch(() => setAdvice(null));
+  }, [state]);
+
+  const initSession = useCallback(async (config, playerDefs) => {
+    const gs = createGameState(config);
+    gs.players = playerDefs.map((pd, i) =>
+      // Open seats are AI-controlled (isAI=true) until a human joins and
+      // claims them via the seat-join screen — see claimSeat() below.
+      createPlayer(i, pd.name, config.stack, pd.isHero, pd.isOpen !== false, pd.isOpen || false)
+    );
+    gs.dealerIdx = 0;
+    if (!LOCAL_MODE && tableId) await createTable(tableId, gs);
+    await persist(gs);
+  }, [persist, tableId]);
+
+  // Called when a friend opens the join screen, picks an open seat, and
+  // types their name. Converts that seat from AI-controlled to human-
+  // controlled. Safe to call concurrently from different devices — relies
+  // on Supabase's last-write-wins, which is acceptable here since seat
+  // claims are rare, deliberate actions (not a hot path like betting).
+  const claimSeat = useCallback(async (seatIdx, playerName) => {
+    const gs = deepClone(stateRef.current);
+    if (!gs) return { ok: false, error: 'No active session' };
+    const seat = gs.players[seatIdx];
+    if (!seat) return { ok: false, error: 'Seat does not exist' };
+    if (!seat.isOpen) return { ok: false, error: 'Seat already taken' };
+
+    seat.isOpen = false;
+    seat.isAI = false;
+    seat.name = playerName.trim().slice(0, 24) || `Player ${seatIdx + 1}`;
+    await persist(gs);
+    return { ok: true, seatIdx };
+  }, [persist]);
+
+  const dealHand = useCallback(async () => {
+    const gs = deepClone(stateRef.current);
+    if (!gs || gs.players.length < 2) return;
+
+    setCoaching(null);
+    setAdvice(null);
+    adviceForTurnRef.current = null;
+
+    gs.handNum++;
+    gs.deck = freshDeck();
+    gs.communityCards = [];
+    gs.pot = 0;
+    gs.currentBet = 0;
+    gs.minRaise = gs.config.bb;
+    gs.phase = 'preflop';
+    gs.log = [];
+    gs.handLog = [];
+    gs.lastCompletedHand = null;
+    gs._handHistorySaved = false;
+    gs.preflopRaiseCount = 0; // tracks how many preflop raises have occurred, for 3-bet detection
+    gs.handResultsRecorded = false; // guards against double-counting stats if hand-end logic runs twice
+
+    gs.players.forEach(p => {
+      if (p.stack <= 0) p.stack = gs.config.stack; // rebuy
+      p.holeCards = [gs.deck.pop(), gs.deck.pop()];
+      p.currentBet = 0;
+      p.status = 'active';
+      p._hand = { vpip: false, pfr: false, threeBet: false, investedThisHand: 0, sawShowdown: false };
+      p.stats.handsPlayed++;
+    });
+
+    gs.dealerIdx = (gs.dealerIdx + 1) % gs.players.length;
+    const n = gs.players.length;
+    const sbIdx = (gs.dealerIdx + 1) % n;
+    const bbIdx = (gs.dealerIdx + 2) % n;
+
+    postBlind(gs, sbIdx, gs.config.sb, 'SB');
+    postBlind(gs, bbIdx, gs.config.bb, 'BB');
+    gs.currentBet = gs.config.bb;
+    gs.minRaise = gs.config.bb;
+    gs.actingIdx = (bbIdx + 1) % n;
+    gs.lastAggressorIdx = bbIdx;
+
+    addLog(gs, `--- Hand #${gs.handNum} ---`, 'system');
+    addLog(gs, `Dealer: Seat ${gs.dealerIdx + 1} | SB: Seat ${sbIdx + 1} | BB: Seat ${bbIdx + 1}`, 'system');
+    gs.sessionStats.handsPlayed++;
+
+    await persist(gs);
+    scheduleVillainIfNeeded(gs);
+  }, [persist]);
+
+  const heroAct = useCallback(async (action, amount = 0) => {
+    const gs = deepClone(stateRef.current);
+    if (!gs) return;
+    const heroIdx = gs.players.findIndex(p => p.isHero);
+    if (gs.actingIdx !== heroIdx) return;
+    const hero = gs.players[heroIdx];
+
+    // Snapshot state BEFORE the action for accurate coaching context
+    const beforeSnapshot = deepClone(gs);
+    const heroBeforeSnapshot = deepClone(hero);
+    const priorAdvice = advice; // what Claude recommended before this action
+
+    applyAction(gs, heroIdx, action, amount);
+
+    const next = advance(gs);
+    const afterSnapshot = deepClone(gs);
+
+    // Advice was for the decision just made — clear it, then show the grade.
+    // No auto-hide: the grade stays visible until the next action replaces it.
+    setAdvice(null);
+    setCoaching({ grade: 'Analyzing…', explanation: 'Consulting AI coach…', source: 'loading' });
+    getCoaching(action, amount, heroBeforeSnapshot, beforeSnapshot, afterSnapshot, priorAdvice)
+      .then(coach => setCoaching(coach))
+      .catch(() => setCoaching(null));
+
+    if (!next) { await persist(gs); return; }
+    await persist(gs);
+    if (gs.phase !== 'showdown' && gs.phase !== 'idle') {
+      scheduleVillainIfNeeded(gs);
+    }
+  }, [persist, advice]);
+
+  // For joined human players (not Hero) — same underlying action logic as
+  // heroAct, but no AI coaching calls (the player view doesn't show coach
+  // panels, so there's no reason to spend API calls or compute fallback
+  // advice here). Works for any seat index.
+  const playerAct = useCallback(async (seatIdx, action, amount = 0) => {
+    const gs = deepClone(stateRef.current);
+    if (!gs) return;
+    if (gs.actingIdx !== seatIdx) return;
+
+    applyAction(gs, seatIdx, action, amount);
+    const next = advance(gs);
+
+    if (!next) { await persist(gs); return; }
+    await persist(gs);
+    if (gs.phase !== 'showdown' && gs.phase !== 'idle') {
+      scheduleVillainIfNeeded(gs);
+    }
+  }, [persist]);
+
+  function scheduleVillainIfNeeded(gs) {
+    if (villainTimerRef.current) clearTimeout(villainTimerRef.current);
+    const cur = gs.players[gs.actingIdx];
+    if (cur && cur.isAI && cur.status === 'active') {
+      villainTimerRef.current = setTimeout(() => runVillainChain(), 750);
+    }
+  }
+
+  async function runVillainChain() {
+    const gs = deepClone(stateRef.current);
+    if (!gs || gs.phase === 'showdown' || gs.phase === 'idle') return;
+    const cur = gs.players[gs.actingIdx];
+    if (!cur || !cur.isAI || cur.status !== 'active') return;
+
+    const { action, amount } = villainDecision(cur, gs);
+    applyAction(gs, gs.actingIdx, action, amount);
+    const cont = advance(gs);
+    await persist(gs);
+
+    if (cont && gs.phase !== 'showdown' && gs.phase !== 'idle') {
+      const next = gs.players[gs.actingIdx];
+      if (next && next.isAI && next.status === 'active') {
+        villainTimerRef.current = setTimeout(() => runVillainChain(), 700);
+      }
+    }
+  }
+
+  return {
+    state, coaching, advice, initSession, dealHand, heroAct, claimSeat, playerAct,
+    closeAdvice: () => setAdvice(null),
+    closeCoaching: () => setCoaching(null),
+  };
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function deepClone(obj) {
+  if (!obj) return obj;
+  return JSON.parse(JSON.stringify(obj));
+}
+
+function postBlind(gs, idx, amount, label) {
+  const p = gs.players[idx];
+  const actual = Math.min(amount, p.stack);
+  p.stack -= actual;
+  p.currentBet += actual;
+  gs.pot += actual;
+  p._hand.investedThisHand += actual; // counts toward net calc, but NOT vpip (blinds are forced)
+  if (p.stack === 0) p.status = 'allin';
+  addLog(gs, `${p.name} posts ${label} ${actual}`, 'system');
+}
+
+function addLog(gs, msg, type = 'action') {
+  gs.log = [...(gs.log || []).slice(-60), { msg, type, ts: Date.now() }];
+  if (gs.handLog) gs.handLog.push({ msg, type });
+}
+
+function applyAction(gs, idx, action, amount = 0) {
+  const p = gs.players[idx];
+  const callAmt = gs.currentBet - p.currentBet;
+  const isPreflop = gs.phase === 'preflop';
+
+  if (action === 'fold') {
+    p.status = 'folded';
+    addLog(gs, `${p.name} folds`, p.isHero ? 'hero' : 'action');
+
+  } else if (action === 'check') {
+    addLog(gs, `${p.name} checks`, p.isHero ? 'hero' : 'action');
+
+  } else if (action === 'call') {
+    const actual = Math.min(callAmt, p.stack);
+    p.stack -= actual; p.currentBet += actual; gs.pot += actual;
+    p._hand.investedThisHand += actual;
+    if (isPreflop && actual > 0) p._hand.vpip = true; // voluntarily called preflop = VPIP
+    if (p.stack === 0) p.status = 'allin';
+    addLog(gs, `${p.name} calls ${actual}`, p.isHero ? 'hero' : 'action');
+
+  } else if (action === 'bet' || action === 'raise') {
+    const toAdd = Math.min(amount - p.currentBet, p.stack);
+    const newBet = p.currentBet + toAdd;
+    gs.minRaise = Math.max(newBet - gs.currentBet, gs.minRaise);
+    gs.currentBet = Math.max(gs.currentBet, newBet);
+    p.stack -= toAdd; p.currentBet = newBet; gs.pot += toAdd;
+    p._hand.investedThisHand += toAdd;
+    if (isPreflop) {
+      p._hand.vpip = true;
+      p._hand.pfr = true; // any preflop raise = PFR
+      gs.preflopRaiseCount = (gs.preflopRaiseCount || 0) + 1;
+      // The SECOND preflop raise in a hand is a 3-bet (first raise = open, second = 3-bet)
+      if (gs.preflopRaiseCount === 2) p._hand.threeBet = true;
+    }
+    if (p.stack === 0) p.status = 'allin';
+    gs.lastAggressorIdx = idx;
+    addLog(gs, `${p.name} ${action}s to ${newBet}`, p.isHero ? 'hero' : 'action');
+
+  } else if (action === 'allin') {
+    const toAdd = p.stack;
+    const newBet = p.currentBet + toAdd;
+    const isRaise = newBet > gs.currentBet;
+    if (isRaise) {
+      gs.minRaise = newBet - gs.currentBet;
+      gs.currentBet = newBet;
+      gs.lastAggressorIdx = idx;
+    }
+    p.stack -= toAdd; p.currentBet = newBet; gs.pot += toAdd;
+    p._hand.investedThisHand += toAdd;
+    if (isPreflop && toAdd > 0) {
+      p._hand.vpip = true;
+      if (isRaise) {
+        p._hand.pfr = true;
+        gs.preflopRaiseCount = (gs.preflopRaiseCount || 0) + 1;
+        if (gs.preflopRaiseCount === 2) p._hand.threeBet = true;
+      }
+    }
+    p.status = 'allin';
+    addLog(gs, `${p.name} ALL-IN for ${newBet}`, p.isHero ? 'hero' : 'action');
+  }
+}
+
+function advance(gs) {
+  const n = gs.players.length;
+  const notFolded = gs.players.filter(p => p.status !== 'folded');
+  const active = gs.players.filter(p => p.status === 'active');
+
+  // Only one player left
+  if (notFolded.length === 1) {
+    awardUncontested(gs, notFolded[0]);
+    return false;
+  }
+
+  // All remaining are allin → runout
+  if (active.length === 0) {
+    runout(gs);
+    return false;
+  }
+
+  // Find next active player who still needs to act
+  let next = (gs.actingIdx + 1) % n;
+  let loops = 0;
+  while (loops < n) {
+    const p = gs.players[next];
+    if (p.status === 'active' && (p.currentBet < gs.currentBet || next !== gs.lastAggressorIdx)) {
+      gs.actingIdx = next;
+      return true;
+    }
+    // If we reach the last aggressor and everyone has acted/matched → next street
+    if (next === gs.lastAggressorIdx && allActed(gs)) break;
+    next = (next + 1) % n;
+    loops++;
+  }
+
+  nextStreet(gs);
+  return gs.phase !== 'showdown';
+}
+
+function allActed(gs) {
+  const active = gs.players.filter(p => p.status === 'active');
+  return active.every(p => p.currentBet === gs.currentBet);
+}
+
+function nextStreet(gs) {
+  const notFolded = gs.players.filter(p => p.status !== 'folded');
+  if (notFolded.length <= 1) { if (notFolded.length === 1) awardUncontested(gs, notFolded[0]); return; }
+
+  gs.players.forEach(p => { p.currentBet = 0; });
+  gs.currentBet = 0;
+  gs.minRaise = gs.config.bb;
+
+  // First active after dealer
+  const n = gs.players.length;
+  let first = (gs.dealerIdx + 1) % n;
+  let tries = 0;
+  while (gs.players[first].status !== 'active' && tries < n) { first = (first + 1) % n; tries++; }
+  gs.actingIdx = first;
+  gs.lastAggressorIdx = first;
+
+  if (gs.phase === 'preflop') {
+    gs.phase = 'flop';
+    for (let i = 0; i < 3; i++) gs.communityCards.push(gs.deck.pop());
+    addLog(gs, '--- FLOP ---', 'system');
+  } else if (gs.phase === 'flop') {
+    gs.phase = 'turn';
+    gs.communityCards.push(gs.deck.pop());
+    addLog(gs, '--- TURN ---', 'system');
+  } else if (gs.phase === 'turn') {
+    gs.phase = 'river';
+    gs.communityCards.push(gs.deck.pop());
+    addLog(gs, '--- RIVER ---', 'system');
+  } else if (gs.phase === 'river') {
+    showdown(gs);
+  }
+}
+
+function runout(gs) {
+  while (gs.communityCards.length < 5) gs.communityCards.push(gs.deck.pop());
+  showdown(gs);
+}
+
+function showdown(gs) {
+  gs.phase = 'showdown';
+  const eligible = gs.players.filter(p => p.status !== 'folded');
+  const results = eligible.map(p => ({
+    player: p,
+    eval: bestHand([...p.holeCards, ...gs.communityCards])
+  })).sort((a, b) => b.eval.score - a.eval.score);
+
+  const topScore = results[0].eval.score;
+  const winners = results.filter(r => r.eval.score === topScore);
+  const share = Math.floor(gs.pot / winners.length);
+
+  // Mark everyone who reached showdown (didn't fold) as having seen it —
+  // this drives the WTSD% stat.
+  eligible.forEach(p => { p._hand.sawShowdown = true; });
+
+  winners.forEach(w => {
+    w.player.stack += share;
+    w.player._hand.totalWonThisHand = share;
+    addLog(gs, `${w.player.name} wins ${share} — ${w.eval.name}`, 'win');
+  });
+
+  gs.showdownResults = results.map(r => ({
+    name: r.player.name, isHero: r.player.isHero,
+    isWinner: r.eval.score === topScore,
+    handName: r.eval.name, won: r.eval.score === topScore ? share : 0,
+    holeCards: r.player.holeCards
+  }));
+
+  finalizeHandStats(gs);
+}
+
+function awardUncontested(gs, winner) {
+  winner.stack += gs.pot;
+  winner._hand.totalWonThisHand = gs.pot;
+  addLog(gs, `${winner.name} wins ${gs.pot} (uncontested)`, 'win');
+  gs.phase = 'showdown';
+  gs.showdownResults = [{ name: winner.name, isWinner: true, handName: 'Uncontested', won: gs.pot, holeCards: winner.holeCards }];
+  finalizeHandStats(gs);
+}
+
+// ─── Stat Finalization ────────────────────────────────────────────────────────
+// Called exactly once per hand, at the moment the hand ends (showdown or
+// uncontested win). Rolls the per-hand transient flags (_hand) into the
+// permanent cumulative stats. This is the ONLY place permanent stats are
+// updated, which is what prevents the old bug where VPIP was incremented
+// on every street instead of once per hand.
+function finalizeHandStats(gs) {
+  if (gs.handResultsRecorded) return; // guard against double-invocation
+  gs.handResultsRecorded = true;
+
+  gs.players.forEach(p => {
+    const h = p._hand || {};
+    if (h.vpip) p.stats.vpipCount++;
+    if (h.pfr) p.stats.pfrCount++;
+    if (h.threeBet) p.stats.threeBetCount++;
+    if (h.sawShowdown) {
+      p.stats.wtsdCount++;
+      if (h.totalWonThisHand > 0) p.stats.wonAtShowdownCount++;
+    }
+    p.stats.totalInvested += h.investedThisHand || 0;
+    p.stats.totalWon += h.totalWonThisHand || 0;
+
+    if (p.isHero) {
+      gs.sessionStats.heroNet += (h.totalWonThisHand || 0) - (h.investedThisHand || 0);
+      if (h.totalWonThisHand > 0) gs.sessionStats.heroWins++;
+    }
+  });
+
+  // Build a structured record of this hand for history/review. Attached to
+  // gameState (not saved here directly) so the hook — which has access to
+  // tableId and the Supabase helpers — can persist it after this returns.
+  gs.lastCompletedHand = {
+    handNum: gs.handNum,
+    dealerIdx: gs.dealerIdx,
+    config: gs.config,
+    players: gs.players.map(p => ({
+      id: p.id, name: p.name, isHero: p.isHero,
+      holeCards: p.holeCards,
+      invested: p._hand?.investedThisHand || 0,
+      won: p._hand?.totalWonThisHand || 0,
+      vpip: !!p._hand?.vpip, pfr: !!p._hand?.pfr, threeBet: !!p._hand?.threeBet,
+      sawShowdown: !!p._hand?.sawShowdown,
+    })),
+    communityCards: gs.communityCards,
+    showdownResults: gs.showdownResults || null,
+    finalPot: gs.pot,
+    log: gs.handLog || [],
+    timestamp: new Date().toISOString(),
+  };
+}

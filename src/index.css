@@ -1,0 +1,84 @@
+@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Inter:wght@400;500;600&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --felt: #0B3D2E;
+  --felt-dark: #082B20;
+  --gold: #C9A84C;
+  --shell: #0A0A0F;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  background: var(--shell);
+  color: #F5F0E8;
+  font-family: 'Inter', sans-serif;
+  margin: 0;
+  overflow: hidden;
+}
+
+.card-face {
+  background: #F5F0E8;
+  border: 1px solid #DDD5C0;
+  border-radius: 5px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  line-height: 1;
+  user-select: none;
+}
+.card-back {
+  background: linear-gradient(135deg, #1A0A0A 0%, #2D1515 50%, #1A0A0A 100%);
+  border: 1px solid #4A2020;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.card-back::after {
+  content: 'A1';
+  font-family: 'Cinzel', serif;
+  font-size: 11px;
+  color: rgba(201,168,76,0.6);
+  font-weight: 700;
+}
+
+.felt-oval {
+  background: radial-gradient(ellipse at 50% 40%, #0E5C3A 0%, #0B3D2E 60%, #082B20 100%);
+  border-radius: 9999px;
+  border: 10px solid #4A3520;
+  box-shadow: 0 0 0 3px #2C1F10, inset 0 2px 20px rgba(0,0,0,0.4);
+}
+
+.seat-ring { transition: box-shadow 0.2s, border-color 0.2s; }
+.seat-ring.active  { border-color: #C9A84C !important; box-shadow: 0 0 12px rgba(201,168,76,0.4); }
+.seat-ring.hero    { border-color: #4A90D9; box-shadow: 0 0 10px rgba(74,144,217,0.35); }
+.seat-ring.allin   { border-color: #E74C3C; box-shadow: 0 0 10px rgba(231,76,60,0.35); }
+.seat-ring.folded  { opacity: 0.35; }
+
+.action-btn {
+  padding: 8px 0;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  font-family: 'Inter', sans-serif;
+  transition: transform 0.12s, opacity 0.12s;
+  flex: 1;
+}
+.action-btn:hover:not(:disabled) { transform: translateY(-2px); }
+.action-btn:active:not(:disabled) { transform: translateY(0); }
+.action-btn:disabled { opacity: 0.28; cursor: not-allowed; }
+
+.scrollbar-gold::-webkit-scrollbar { width: 3px; }
+.scrollbar-gold::-webkit-scrollbar-track { background: transparent; }
+.scrollbar-gold::-webkit-scrollbar-thumb { background: rgba(201,168,76,0.35); border-radius: 2px; }
+
+@keyframes dealIn { from { transform: scale(0.5) rotate(-15deg); opacity: 0; } to { transform: scale(1) rotate(0); opacity: 1; } }
+.deal-anim { animation: dealIn 0.25s ease-out; }
