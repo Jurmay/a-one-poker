@@ -32,9 +32,17 @@ export async function getTable(tableId) {
   return data;
 }
 
+// Each call gets its OWN uniquely-named channel, even when subscribing to
+// the same table. Supabase channels are matched by name — two separate
+// components (e.g. JoinScreen and useGameState) both subscribing to
+// "table:aone-main" at the same time collide and throw
+// "cannot add postgres_changes callbacks... after subscribe()". A random
+// suffix per call keeps every subscriber's channel independent.
+let _channelCounter = 0;
 export function subscribeToTable(tableId, onUpdate) {
+  const channelName = `table:${tableId}:${Date.now()}:${_channelCounter++}`;
   return supabase
-    .channel(`table:${tableId}`)
+    .channel(channelName)
     .on('postgres_changes', {
       event: 'UPDATE',
       schema: 'public',
