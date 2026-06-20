@@ -1,7 +1,7 @@
 import React from 'react';
 import { Card, CardPlaceholder } from './Card';
 
-export function PlayerSeat({ player, isActive, isDealer, showCards = false, style, onClick }) {
+export function PlayerSeat({ player, isActive, isDealer, showCards = false, isViewerSeat = false, style, onClick }) {
   const ringClass = [
     'seat-ring',
     isActive ? 'active' : '',
@@ -19,12 +19,16 @@ export function PlayerSeat({ player, isActive, isDealer, showCards = false, styl
 
   return (
     <div style={style} className="absolute flex flex-col items-center gap-1 -translate-x-1/2 -translate-y-1/2">
-      {/* Cards */}
+      {/* Cards — face up ONLY at showdown, or for whichever seat belongs to
+          the person actually viewing this screen (isViewerSeat). This is
+          NOT the same as player.isHero: in multiplayer, each joined friend
+          views the identical PokerTable component, but should only ever
+          see their OWN cards, never Hero's or another player's. */}
       <div className="flex gap-1 relative">
         {player.holeCards?.length === 2 ? (
           <>
-            <Card card={player.holeCards[0]} size="sm" faceDown={!showCards && !player.isHero} />
-            <Card card={player.holeCards[1]} size="sm" faceDown={!showCards && !player.isHero} />
+            <Card card={player.holeCards[0]} size="sm" faceDown={!showCards && !isViewerSeat} />
+            <Card card={player.holeCards[1]} size="sm" faceDown={!showCards && !isViewerSeat} />
           </>
         ) : (
           <>

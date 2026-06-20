@@ -122,7 +122,11 @@ function AdminApp() {
       <div className="flex flex-1 overflow-hidden">
         <div className="flex-1 flex items-center justify-center overflow-hidden p-4">
           {state ? (
-            <PokerTable state={state} onSelectVillain={(p) => setSelectedVillainId(p.id)} />
+            <PokerTable
+              state={state}
+              onSelectVillain={(p) => setSelectedVillainId(p.id)}
+              viewerSeatIdx={state.players.findIndex(p => p.isHero)}
+            />
           ) : (
             <div className="text-center">
               <div className="font-cinzel text-gold/30 text-2xl tracking-[6px] mb-3">A-ONE POKER</div>

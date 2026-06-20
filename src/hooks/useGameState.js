@@ -3,7 +3,7 @@ import {
   freshDeck, bestHand, villainDecision,
   createPlayer, createGameState, HAND_NAMES
 } from '../engine/poker';
-import { createTable, updateTable, subscribeToTable, saveHandHistory } from '../lib/supabase';
+import { createTable, updateTable, subscribeToTable, saveHandHistory, getTable } from '../lib/supabase';
 import { getCoaching, getPreActionAdvice } from '../lib/claudeCoach';
 
 const LOCAL_MODE = !process.env.REACT_APP_SUPABASE_URL;
@@ -31,14 +31,27 @@ export function useGameState(tableId, isAdmin = true) {
     }
   }, [tableId]);
 
-  // Subscribe to remote updates (villain screens)
+  // Subscribe to remote updates (villain screens / joined friends), and
+  // — critically — fetch the CURRENT state once on mount. Without this,
+  // a freshly-loaded friend's browser has stateRef.current === null until
+  // the next time someone else pushes an update, which silently breaks
+  // claimSeat() (it bails out early on null state) right when a friend
+  // first tries to join.
   useEffect(() => {
     if (LOCAL_MODE || !tableId || isAdmin) return;
+    let cancelled = false;
+
+    getTable(tableId).then(row => {
+      if (cancelled || !row?.state) return;
+      stateRef.current = row.state;
+      setState(row.state);
+    });
+
     const sub = subscribeToTable(tableId, (remoteState) => {
       stateRef.current = remoteState;
       setState(remoteState);
     });
-    return () => { sub.unsubscribe(); };
+    return () => { cancelled = true; sub.unsubscribe(); };
   }, [tableId, isAdmin]);
 
   // Fire pre-action advice automatically whenever it becomes Hero's turn.
@@ -79,7 +92,15 @@ export function useGameState(tableId, isAdmin = true) {
   // on Supabase's last-write-wins, which is acceptable here since seat
   // claims are rare, deliberate actions (not a hot path like betting).
   const claimSeat = useCallback(async (seatIdx, playerName) => {
-    const gs = deepClone(stateRef.current);
+    let gs = deepClone(stateRef.current);
+    if (!gs) {
+      // Local state hasn't loaded yet (e.g. claimSeat called very soon
+      // after mount, before the initial getTable() fetch resolved) — fetch
+      // directly rather than failing. This is the fix for a real bug where
+      // a freshly-joined friend's name silently never saved.
+      const row = await getTable(tableId);
+      gs = row?.state ? deepClone(row.state) : null;
+    }
     if (!gs) return { ok: false, error: 'No active session' };
     const seat = gs.players[seatIdx];
     if (!seat) return { ok: false, error: 'Seat does not exist' };
@@ -90,7 +111,7 @@ export function useGameState(tableId, isAdmin = true) {
     seat.name = playerName.trim().slice(0, 24) || `Player ${seatIdx + 1}`;
     await persist(gs);
     return { ok: true, seatIdx };
-  }, [persist]);
+  }, [persist, tableId]);
 
   const dealHand = useCallback(async () => {
     const gs = deepClone(stateRef.current);

@@ -16,7 +16,7 @@ function seatPositions(n, rxFrac = 0.84, ryFrac = 0.82) {
   });
 }
 
-export function PokerTable({ state, onSelectVillain }) {
+export function PokerTable({ state, onSelectVillain, viewerSeatIdx = null }) {
   const { players = [], communityCards = [], pot = 0, phase = 'idle', actingIdx, dealerIdx, showdownResults } = state || {};
 
   const positions = useMemo(() => seatPositions(players.length), [players.length]);
@@ -81,6 +81,7 @@ export function PokerTable({ state, onSelectVillain }) {
             isActive={i === actingIdx}
             isDealer={i === dealerIdx}
             showCards={isShowdown}
+            isViewerSeat={viewerSeatIdx !== null && i === viewerSeatIdx}
             onClick={onSelectVillain}
             style={{ top: `${positions[i]?.yPct}%`, left: `${positions[i]?.xPct}%` }}
           />

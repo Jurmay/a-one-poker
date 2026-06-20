@@ -40,7 +40,7 @@ export function PlayerView({ state, seatIdx, onAction }) {
 
       {/* Table */}
       <div className="flex-1 flex items-center justify-center overflow-hidden p-4">
-        {state && <PokerTable state={state} />}
+        {state && <PokerTable state={state} viewerSeatIdx={seatIdx} />}
       </div>
 
       {/* Player console — same controls as Hero, no coach panels */}
