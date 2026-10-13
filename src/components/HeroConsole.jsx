@@ -2,7 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { Card } from './Card';
 import { bestHand, GRADE_COLORS } from '../engine/poker';
 
-export function HeroConsole({ state, coaching, advice, onAction, onCloseAdvice, onCloseCoaching }) {
+export function HeroConsole({ state, coaching, advice, autoPlay, onAction, onCloseAdvice, onCloseCoaching }) {
   const [raiseAmt, setRaiseAmt] = useState(0);
 
   const hero = state?.players?.find(p => p.isHero);
@@ -78,7 +78,7 @@ export function HeroConsole({ state, coaching, advice, onAction, onCloseAdvice, 
               title="Dismiss"
             >✕</button>
             <div className="flex items-center justify-between mb-1 pr-4">
-              <span className="text-[9px] text-sky-400/70 tracking-widest">AI RECOMMENDS</span>
+              <span className="text-[9px] text-sky-400/70 tracking-widest">{autoPlay ? 'AI PLAYS' : 'AI RECOMMENDS'}</span>
               {advice.source === 'claude' && (
                 <span className="text-[8px] text-emerald-500/70" title="Powered by Claude">●</span>
               )}
@@ -92,9 +92,16 @@ export function HeroConsole({ state, coaching, advice, onAction, onCloseAdvice, 
               <>
                 {advice.recommendation ? (
                   <div className="text-base font-bold text-sky-400 mb-1">
-                    {advice.recommendation}{advice.sizing ? <span className="text-xs text-sky-400/70 font-medium ml-1">({advice.sizing})</span> : null}
+                    {advice.recommendation}
+                    {advice.amount ? <span className="text-xs text-sky-400/70 font-medium ml-1">to {advice.amount.toLocaleString()}</span> : null}
+                    {advice.sizing ? <span className="text-xs text-sky-400/70 font-medium ml-1">({advice.sizing})</span> : null}
                   </div>
                 ) : null}
+                {advice.strategy && Object.keys(advice.strategy).length > 1 && (
+                  <div className="text-[9px] text-sky-300/60 mb-1" title="Mixed strategy — the app picked one action at random using these frequencies">
+                    Mix: {Object.entries(advice.strategy).map(([a, f]) => `${a} ${f}%`).join(' · ')}
+                  </div>
+                )}
                 <div className="text-[10px] text-white/55 leading-relaxed">{advice.reasoning}</div>
               </>
             )}

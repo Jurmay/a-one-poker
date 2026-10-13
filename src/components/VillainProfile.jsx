@@ -34,6 +34,10 @@ export function VillainProfile({ player, onClose }) {
   const wtsd = pct(s.wtsdCount, hands);
   const wsd = pct(s.wonAtShowdownCount, s.wtsdCount); // % won GIVEN they reached showdown
   const net = (s.totalWon || 0) - (s.totalInvested || 0);
+  const foldToBet = pct(s.foldedToPostflopBetCount, s.facedPostflopBetCount);
+  const pfCalls = s.postflopCallCount || 0;
+  const pfAggr = s.postflopAggressiveCount || 0;
+  const af = pfCalls > 0 ? (pfAggr / pfCalls).toFixed(1) : (pfAggr > 0 ? '∞' : '—');
 
   // Simple playstyle read derived from VPIP/PFR — this is a description of
   // observed tendency, not a claim about the player's actual strategy.
@@ -74,6 +78,8 @@ export function VillainProfile({ player, onClose }) {
               <StatRow label="3-Bet" value={`${threeBet}%`} hint="re-raises preflop" />
               <StatRow label="WTSD" value={`${wtsd}%`} hint="reaches showdown" />
               <StatRow label="W$SD" value={s.wtsdCount > 0 ? `${wsd}%` : '—'} hint="wins at showdown" />
+              <StatRow label="Fold to Bet" value={s.facedPostflopBetCount > 0 ? `${foldToBet}%` : '—'} hint="post-flop" />
+              <StatRow label="AF" value={af} hint="post-flop bets+raises / calls" />
               <StatRow
                 label="Net (session)"
                 value={`${net >= 0 ? '+' : ''}${net.toLocaleString()}`}
