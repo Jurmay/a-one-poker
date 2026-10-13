@@ -48,7 +48,10 @@ function AdminApp() {
   const [showHistory, setShowHistory] = useState(false);
   const [showJoinLink, setShowJoinLink] = useState(false);
 
-  const { state, coaching, advice, initSession, dealHand, heroAct, closeAdvice, closeCoaching } = useGameState(TABLE_ID, true);
+  const {
+    state, coaching, advice, initSession, dealHand, heroAct, closeAdvice, closeCoaching,
+    autoPlay, setAutoPlay,
+  } = useGameState(TABLE_ID, true);
 
   const handleStart = useCallback(async (config, playerDefs) => {
     await initSession(config, playerDefs);
@@ -82,6 +85,19 @@ function AdminApp() {
           >
             ⚙ Setup
           </button>
+          {sessionStarted && (
+            <button
+              onClick={() => setAutoPlay(on => !on)}
+              title="When on, Claude plays Hero's decisions automatically"
+              className={`border px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                autoPlay
+                  ? 'text-sky-300 border-sky-500/60 bg-sky-500/20 hover:bg-sky-500/30'
+                  : 'text-gold border-gold/30 bg-gold/10 hover:bg-gold/20'
+              }`}
+            >
+              🤖 Auto-play: {autoPlay ? 'ON' : 'OFF'}
+            </button>
+          )}
           {sessionStarted && (
             <button
               onClick={() => setShowJoinLink(true)}
@@ -142,6 +158,7 @@ function AdminApp() {
           state={state}
           coaching={coaching}
           advice={advice}
+          autoPlay={autoPlay}
           onAction={heroAct}
           onCloseAdvice={closeAdvice}
           onCloseCoaching={closeCoaching}

@@ -33,11 +33,24 @@ export function createPlayer(id, name, stack, isHero = false, isAI = true, isOpe
       vpipCount: 0, pfrCount: 0, threeBetCount: 0,
       wtsdCount: 0, wonAtShowdownCount: 0,
       totalInvested: 0, totalWon: 0,
+      // Post-flop tendencies. "Faced a bet" / "folded to a bet" count at most
+      // once per hand; aggressive/call counts are per action (for the
+      // aggression factor = bets+raises / calls).
+      facedPostflopBetCount: 0, foldedToPostflopBetCount: 0,
+      postflopAggressiveCount: 0, postflopCallCount: 0,
     },
     // Per-hand transient flags — reset at the start of every hand, read once
     // at hand-end to update the permanent stats above. Not meant to be
     // displayed directly; _prefixed to signal "internal, this-hand-only".
-    _hand: { vpip: false, pfr: false, threeBet: false, investedThisHand: 0, sawShowdown: false },
+    _hand: freshHandFlags(),
+  };
+}
+
+export function freshHandFlags() {
+  return {
+    vpip: false, pfr: false, threeBet: false, investedThisHand: 0, sawShowdown: false,
+    facedPostflopBet: false, foldedToPostflopBet: false,
+    postflopAggressive: 0, postflopCalls: 0,
   };
 }
 

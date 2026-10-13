@@ -1,10 +1,20 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   freshDeck, bestHand, villainDecision,
-  createPlayer, createGameState, HAND_NAMES
+  createPlayer, createGameState, freshHandFlags
 } from '../engine/poker';
 import { createTable, updateTable, subscribeToTable, saveHandHistory, getTable } from '../lib/supabase';
 import { getCoaching, getPreActionAdvice } from '../lib/claudeCoach';
+
+// How many revealed showdown hands to keep in game state for opponent reads.
+const SHOWDOWN_HISTORY_LIMIT = 40;
+// Pause before an auto-played hero action, so humans at the table can follow it.
+const AUTO_PLAY_DELAY_MS = 900;
+
+// Identifies one hero decision point (hand + street + seat + bet state).
+export function turnFingerprint(state) {
+  return `${state.handNum}:${state.phase}:${state.actingIdx}:${state.pot}:${state.currentBet}`;
+}
 
 const LOCAL_MODE = !process.env.REACT_APP_SUPABASE_URL;
 
@@ -15,6 +25,10 @@ export function useGameState(tableId, isAdmin = true) {
   const stateRef = useRef(null);
   const villainTimerRef = useRef(null);
   const adviceForTurnRef = useRef(null); // tracks which "turn" we already fetched advice for, to avoid duplicate calls
+  // Auto-play: Claude makes Hero's decisions instead of the human at the console.
+  const [autoPlay, setAutoPlay] = useState(false);
+  const autoActedForTurnRef = useRef(null);
+  const heroActRef = useRef(null);
 
   const persist = useCallback(async (newState) => {
     stateRef.current = newState;
@@ -63,16 +77,39 @@ export function useGameState(tableId, isAdmin = true) {
     if (heroIdx === -1 || state.actingIdx !== heroIdx) return;
     if (state.phase === 'idle' || state.phase === 'showdown') return;
 
-    const fingerprint = `${state.handNum}:${state.phase}:${state.actingIdx}:${state.pot}:${state.currentBet}`;
+    const fingerprint = turnFingerprint(state);
     if (adviceForTurnRef.current === fingerprint) return;
     adviceForTurnRef.current = fingerprint;
 
     const hero = state.players[heroIdx];
-    setAdvice({ source: 'loading' });
+    setAdvice({ source: 'loading', fingerprint });
     getPreActionAdvice(hero, state)
-      .then(result => setAdvice(result))
+      .then(result => {
+        // Drop late answers for a decision that's already been made.
+        if (adviceForTurnRef.current === fingerprint) setAdvice({ ...result, fingerprint });
+      })
       .catch(() => setAdvice(null));
   }, [state]);
+
+  // Auto-play: once advice for the current decision arrives, play it.
+  // Also fires if auto-play is switched on while advice is already showing.
+  useEffect(() => {
+    if (!autoPlay || !state || !advice || advice.source === 'loading' || !advice.action) return;
+    const heroIdx = state.players?.findIndex(p => p.isHero);
+    if (heroIdx === -1 || state.actingIdx !== heroIdx) return;
+    if (state.phase === 'idle' || state.phase === 'showdown') return;
+
+    const fingerprint = turnFingerprint(state);
+    if (advice.fingerprint !== fingerprint || autoActedForTurnRef.current === fingerprint) return;
+
+    const timer = setTimeout(() => {
+      const cur = stateRef.current;
+      if (!cur || turnFingerprint(cur) !== fingerprint) return; // someone already acted
+      autoActedForTurnRef.current = fingerprint;
+      heroActRef.current?.(advice.action, advice.amount || 0, { auto: true });
+    }, AUTO_PLAY_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [autoPlay, advice, state]);
 
   const initSession = useCallback(async (config, playerDefs) => {
     const gs = createGameState(config);
@@ -130,6 +167,7 @@ export function useGameState(tableId, isAdmin = true) {
     gs.phase = 'preflop';
     gs.log = [];
     gs.handLog = [];
+    gs.handActions = []; // structured action list for this hand (sent to the AI advisor)
     gs.lastCompletedHand = null;
     gs._handHistorySaved = false;
     gs.preflopRaiseCount = 0; // tracks how many preflop raises have occurred, for 3-bet detection
@@ -140,7 +178,7 @@ export function useGameState(tableId, isAdmin = true) {
       p.holeCards = [gs.deck.pop(), gs.deck.pop()];
       p.currentBet = 0;
       p.status = 'active';
-      p._hand = { vpip: false, pfr: false, threeBet: false, investedThisHand: 0, sawShowdown: false };
+      p._hand = freshHandFlags();
       p.stats.handsPlayed++;
     });
 
@@ -164,7 +202,7 @@ export function useGameState(tableId, isAdmin = true) {
     scheduleVillainIfNeeded(gs);
   }, [persist]);
 
-  const heroAct = useCallback(async (action, amount = 0) => {
+  const heroAct = useCallback(async (action, amount = 0, { auto = false } = {}) => {
     const gs = deepClone(stateRef.current);
     if (!gs) return;
     const heroIdx = gs.players.findIndex(p => p.isHero);
@@ -183,11 +221,16 @@ export function useGameState(tableId, isAdmin = true) {
 
     // Advice was for the decision just made — clear it, then show the grade.
     // No auto-hide: the grade stays visible until the next action replaces it.
+    // Auto-played actions aren't graded: the coach would just be grading Claude's own play.
     setAdvice(null);
-    setCoaching({ grade: 'Analyzing…', explanation: 'Consulting AI coach…', source: 'loading' });
-    getCoaching(action, amount, heroBeforeSnapshot, beforeSnapshot, afterSnapshot, priorAdvice)
-      .then(coach => setCoaching(coach))
-      .catch(() => setCoaching(null));
+    if (auto) {
+      setCoaching(null);
+    } else {
+      setCoaching({ grade: 'Analyzing…', explanation: 'Consulting AI coach…', source: 'loading' });
+      getCoaching(action, amount, heroBeforeSnapshot, beforeSnapshot, afterSnapshot, priorAdvice)
+        .then(coach => setCoaching(coach))
+        .catch(() => setCoaching(null));
+    }
 
     if (!next) { await persist(gs); return; }
     await persist(gs);
@@ -195,6 +238,7 @@ export function useGameState(tableId, isAdmin = true) {
       scheduleVillainIfNeeded(gs);
     }
   }, [persist, advice]);
+  heroActRef.current = heroAct;
 
   // For joined human players (not Hero) — same underlying action logic as
   // heroAct, but no AI coaching calls (the player view doesn't show coach
@@ -244,6 +288,7 @@ export function useGameState(tableId, isAdmin = true) {
 
   return {
     state, coaching, advice, initSession, dealHand, heroAct, claimSeat, playerAct,
+    autoPlay, setAutoPlay,
     closeAdvice: () => setAdvice(null),
     closeCoaching: () => setCoaching(null),
   };
@@ -264,7 +309,16 @@ function postBlind(gs, idx, amount, label) {
   gs.pot += actual;
   p._hand.investedThisHand += actual; // counts toward net calc, but NOT vpip (blinds are forced)
   if (p.stack === 0) p.status = 'allin';
+  recordAction(gs, idx, `posts ${label}`, actual);
   addLog(gs, `${p.name} posts ${label} ${actual}`, 'system');
+}
+
+// Structured per-hand action record. Unlike handLog (display strings), this
+// is what the AI advisor reads to see how the current hand has played out.
+function recordAction(gs, idx, action, amount = 0) {
+  if (!gs.handActions) gs.handActions = [];
+  const p = gs.players[idx];
+  gs.handActions.push({ street: gs.phase, seat: idx, name: p.name, action, amount });
 }
 
 function addLog(gs, msg, type = 'action') {
@@ -276,12 +330,19 @@ function applyAction(gs, idx, action, amount = 0) {
   const p = gs.players[idx];
   const callAmt = gs.currentBet - p.currentBet;
   const isPreflop = gs.phase === 'preflop';
+  const h = p._hand;
+
+  // Post-flop tendencies: did they face a bet this hand, and fold to it?
+  if (!isPreflop && callAmt > 0) h.facedPostflopBet = true;
 
   if (action === 'fold') {
     p.status = 'folded';
+    if (!isPreflop && callAmt > 0) h.foldedToPostflopBet = true;
+    recordAction(gs, idx, 'folds');
     addLog(gs, `${p.name} folds`, p.isHero ? 'hero' : 'action');
 
   } else if (action === 'check') {
+    recordAction(gs, idx, 'checks');
     addLog(gs, `${p.name} checks`, p.isHero ? 'hero' : 'action');
 
   } else if (action === 'call') {
@@ -289,7 +350,9 @@ function applyAction(gs, idx, action, amount = 0) {
     p.stack -= actual; p.currentBet += actual; gs.pot += actual;
     p._hand.investedThisHand += actual;
     if (isPreflop && actual > 0) p._hand.vpip = true; // voluntarily called preflop = VPIP
+    if (!isPreflop && actual > 0) h.postflopCalls = (h.postflopCalls || 0) + 1;
     if (p.stack === 0) p.status = 'allin';
+    recordAction(gs, idx, 'calls', actual);
     addLog(gs, `${p.name} calls ${actual}`, p.isHero ? 'hero' : 'action');
 
   } else if (action === 'bet' || action === 'raise') {
@@ -305,9 +368,12 @@ function applyAction(gs, idx, action, amount = 0) {
       gs.preflopRaiseCount = (gs.preflopRaiseCount || 0) + 1;
       // The SECOND preflop raise in a hand is a 3-bet (first raise = open, second = 3-bet)
       if (gs.preflopRaiseCount === 2) p._hand.threeBet = true;
+    } else {
+      h.postflopAggressive = (h.postflopAggressive || 0) + 1;
     }
     if (p.stack === 0) p.status = 'allin';
     gs.lastAggressorIdx = idx;
+    recordAction(gs, idx, `${action}s to`, newBet);
     addLog(gs, `${p.name} ${action}s to ${newBet}`, p.isHero ? 'hero' : 'action');
 
   } else if (action === 'allin') {
@@ -329,7 +395,12 @@ function applyAction(gs, idx, action, amount = 0) {
         if (gs.preflopRaiseCount === 2) p._hand.threeBet = true;
       }
     }
+    if (!isPreflop && toAdd > 0) {
+      if (isRaise) h.postflopAggressive = (h.postflopAggressive || 0) + 1;
+      else h.postflopCalls = (h.postflopCalls || 0) + 1;
+    }
     p.status = 'allin';
+    recordAction(gs, idx, 'goes all-in for', newBet);
     addLog(gs, `${p.name} ALL-IN for ${newBet}`, p.isHero ? 'hero' : 'action');
   }
 }
@@ -442,6 +513,25 @@ function showdown(gs) {
     holeCards: r.player.holeCards
   }));
 
+  // Remember what each player showed down, and how they played it. Only
+  // hands actually revealed here go in — never folded or uncontested cards.
+  const revealed = results.map(r => {
+    const seat = gs.players.indexOf(r.player);
+    return {
+      handNum: gs.handNum,
+      playerId: r.player.id,
+      name: r.player.name,
+      holeCards: r.player.holeCards,
+      handName: r.eval.name,
+      won: r.eval.score === topScore,
+      board: [...gs.communityCards],
+      actions: (gs.handActions || [])
+        .filter(a => a.seat === seat && !a.action.startsWith('posts'))
+        .map(a => ({ street: a.street, action: a.action, amount: a.amount })),
+    };
+  });
+  gs.showdownHistory = [...(gs.showdownHistory || []), ...revealed].slice(-SHOWDOWN_HISTORY_LIMIT);
+
   finalizeHandStats(gs);
 }
 
@@ -473,6 +563,10 @@ function finalizeHandStats(gs) {
       p.stats.wtsdCount++;
       if (h.totalWonThisHand > 0) p.stats.wonAtShowdownCount++;
     }
+    if (h.facedPostflopBet) p.stats.facedPostflopBetCount = (p.stats.facedPostflopBetCount || 0) + 1;
+    if (h.foldedToPostflopBet) p.stats.foldedToPostflopBetCount = (p.stats.foldedToPostflopBetCount || 0) + 1;
+    p.stats.postflopAggressiveCount = (p.stats.postflopAggressiveCount || 0) + (h.postflopAggressive || 0);
+    p.stats.postflopCallCount = (p.stats.postflopCallCount || 0) + (h.postflopCalls || 0);
     p.stats.totalInvested += h.investedThisHand || 0;
     p.stats.totalWon += h.totalWonThisHand || 0;
 
